@@ -70,9 +70,16 @@ export default function Layout() {
 
   return (
     <div className="flex h-full min-h-screen">
+      {/* Desktop sidebar */}
       <aside className="hidden w-60 shrink-0 flex-col bg-charcoal-900 lg:flex">
         {brand}
         {nav}
+        <div className="mt-auto px-5 py-4 text-xs leading-relaxed text-charcoal-400">
+          <div className="flex items-center gap-1.5 font-medium text-charcoal-300">
+            <Eye className="h-3.5 w-3.5" aria-hidden="true" /> Monitoring only
+          </div>
+          Read-only view. No machinery can be started, stopped or adjusted from this application.
+        </div>
       </aside>
 
       {/* Mobile drawer */}
@@ -97,6 +104,12 @@ export default function Layout() {
             <Menu className="h-5 w-5" />
           </button>
           <div className="flex-1 text-sm font-semibold text-slate-700 lg:hidden">Rice Mill Monitoring</div>
+          <div className="hidden flex-1 text-xs text-slate-500 lg:block">Read-only monitoring · SELEC MFM384 meters via IoT gateways</div>
+          {source === 'mock' && (
+            <span className="rounded border border-violet-300 bg-violet-50 px-2 py-1 text-xs font-semibold text-violet-800" title="Values come from the bundled development mock API, not real meters">
+              SIMULATED DATA
+            </span>
+          )}
           <ConnectionPill />
         </header>
 
