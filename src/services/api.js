@@ -13,19 +13,40 @@ export function describeError(e) {
   // return e?.message || 'Unknown error';
 }
 
-const get = (url, params, signal) => http.get(url, { params, signal }).then((r) => r.data);
+const DEMO = import.meta.env.VITE_DEMO === '1';
+let enginePromise;
+function loadEngine() {
+  globalThis.__MOCK_SHIFT__ ??= '0-24';
+  if (typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('faults') === '0') {
+    globalThis.__MOCK_FAULTS__ = '0';
+  }
+  enginePromise ??= import('../../mock-server/engine.js').then((engine) => {
+    setInterval(() => engine.tick(), 2000);
+    return engine;
+  });
+  return enginePromise;
+}
 
-// Live snapshot of all motors + gateways (see docs/API.md)
+async function demoGet(url, params) {
+  const engine = await loadEngine();
+  const q = new URLSearchParams();
+  for (const [k, v] of Object.entries(params || {})) if (v !== undefined && v !== null) q.set(k, String(v));
+  const { status, body } = engine.handle(`/api${url}`, q);
+  if (status >= 400) throw new Error(`API returned ${status}${body?.error ? `: ${body.error}` : ''}`);
+  return body;
+}
+
+const get = DEMO
+  ? (url, params) => demoGet(url, params)
+  : (url, params, signal) => http.get(url, { params, signal }).then((r) => r.data);
+
 export const getLive = (signal) => get('/motors/live', undefined, signal);
 
-// range: 1h | 24h | 7d | 30d
 export const getMotorHistory = (motorId, range, signal) =>
   get(`/motors/${encodeURIComponent(motorId)}/history`, { range }, signal);
 
-// from/to are ISO timestamps
 export const getReport = (from, to, signal) => get('/reports', { from, to }, signal);
 
-// motorId optional ("all" when omitted)
 export const getReadings = (from, to, motorId, signal) =>
   get('/readings', { from, to, ...(motorId && motorId !== 'all' ? { motorId } : {}) }, signal);
 

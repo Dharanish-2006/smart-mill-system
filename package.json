@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "mock": "node mock-server/server.js",
     "dev:mock": "concurrently -n mock,web -c yellow,green \"npm:mock\" \"npm:dev\"",
-    "test": "node --test tests/status.test.js tests/aggregates.test.js tests/alerts.test.js tests/csv.test.js"
+    "test": "node --test tests/status.test.js tests/aggregates.test.js tests/alerts.test.js tests/csv.test.js",
+    "build:demo": "vite build --mode demo"
   },
   "dependencies": {
     "axios": "^1.20.0",

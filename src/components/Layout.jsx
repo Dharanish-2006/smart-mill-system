@@ -97,11 +97,6 @@ export default function Layout() {
             <Menu className="h-5 w-5" />
           </button>
           <div className="flex-1 text-sm font-semibold text-slate-700 lg:hidden">Rice Mill Monitoring</div>
-          {/* {source === 'mock' && (
-            <span className="rounded border border-violet-300 bg-violet-50 px-2 py-1 text-xs font-semibold text-violet-800" title="Values come from the bundled development mock API, not real meters">
-              SIMULATED DATA
-            </span>
-          )} */}
           <ConnectionPill />
         </header>
 
