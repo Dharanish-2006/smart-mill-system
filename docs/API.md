@@ -1,0 +1,213 @@
+# Backend API contract
+
+The frontend talks to the backend only through `src/api/http.js`. This file is the
+contract that backend must meet. A runnable reference that answers every endpoint
+with fake data is in `scripts/dev-api.mjs` (`pnpm dev:api`).
+
+## Conventions
+
+- Base URL: `VITE_API_URL` (default `/api`). All bodies are JSON.
+- Times are **milliseconds since the Unix epoch (UTC)**. The UI shows them in IST.
+- Authentication: `Authorization: Bearer <token>` on every request except
+  login and register. If the backend prefers an httpOnly session cookie, set
+  `VITE_API_CREDENTIALS=true`, return no `token` from login, and enable CORS
+  credentials (or serve both from one origin).
+- **401** on any authenticated call signs the user out in the app.
+- Errors: any non-2xx response should be `{ "message": "…", "code": "snake_case" }`.
+  `message` is shown to the user as-is for 4xx, so keep it plain and safe.
+  For 5xx the UI shows a generic message and ignores the body.
+- **Enforce permissions on the server.** The UI hides admin controls from regular
+  users, but that is only a convenience. Admin-only endpoints must return 403 to
+  non-admins.
+- Never return password hashes.
+
+## Auth
+
+| Method | Path                    | Body                                                                              | Response                                                                                                                                                                                                       |
+| ------ | ----------------------- | --------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| POST   | `/auth/login`           | `{ username, password }`                                                          | `{ token, user }`. 401 wrong credentials; 403 with `code: "pending_approval"` if not yet approved                                                                                                              |
+| POST   | `/auth/otp/send`        | `{ channel: "email" \| "phone", target }`                                         | 204. Generate a 6-digit code server-side, expire it in ~5 min, send it out of band. Rate-limit per target and IP                                                                                               |
+| POST   | `/auth/otp/verify`      | `{ channel, target, code }`                                                       | `{ token }` (short-lived, single-use proof). 400 wrong/expired code; 429 after 5 wrong tries                                                                                                                   |
+| POST   | `/auth/register`        | `{ fullName, username, email, emailToken, mobile?, phoneToken?, password, role }` | 201. `emailToken` is required and must match `email`; `mobile` is optional but if sent needs a matching `phoneToken`. Starts as `pending`. 409 if username is taken. Treat `role: "admin"` as a _request_ only |
+| GET    | `/auth/me`              |                                                                                   | `user`                                                                                                                                                                                                         |
+| POST   | `/auth/logout`          |                                                                                   | 204                                                                                                                                                                                                            |
+| POST   | `/auth/change-password` | `{ currentPassword, newPassword }`                                                | 204. 400 if current password is wrong                                                                                                                                                                          |
+
+`user`: `{ id, username, fullName, email, mobile, role: "admin" | "user", status: "active" | "pending" }`
+
+Rate-limit login and registration on the server.
+
+## Users (admin only)
+
+Served by the Admin Portal; plant owners get a 403.
+
+| Method | Path                                 | Response                             |
+| ------ | ------------------------------------ | ------------------------------------ |
+| GET    | `/admin-portal/users?status=pending` | `[user]`                             |
+| POST   | `/admin-portal/users/:id/approve`    | the updated user                     |
+| POST   | `/admin-portal/users/:id/reject`     | the updated user. Body `{ reason? }` |
+
+## Plants, machines, alerts (any signed-in user)
+
+| Method | Path                                       | Response                                                                                                                |
+| ------ | ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
+| GET    | `/plants`                                  | `["Plant 1"]`                                                                                                           |
+| GET    | `/machines?plant=Plant 1`                  | `{ serverTime, machines: [machine] }`                                                                                   |
+| GET    | `/machines/usage?plant=&range=day\|week\|month` | `{ consumedKwh, actualKwh }` plant totals for the last 7 / 30 days (the dashboard computes "last day" from `hourlyKwh`) |
+| GET    | `/machines/:id/summary?hours=12\|24\|168\|720` | `{ hours, kwh, runKwh, runSeconds, avgLoadFactor, avgPf }` for one machine over the window (hourly reports) |
+| GET    | `/machines/:id/trend?hours=6`              | `[{ t, pf, current, kw }]`, oldest first                                                                                |
+| GET    | `/alerts?plant=Plant 1`                    | `[alert]`, active first (critical, then newest), then recovered (newest first)                                          |
+
+The app calls `/machines` and `/alerts` every `VITE_POLL_INTERVAL_MS` (5 s).
+Keep them fast. It backs off automatically when they fail.
+
+Any signed-in user can rename a machine they can see and change its rating, from the Reports and machine pages: `PUT /machines/:id` with
+`{ "name": "Sheller 1", "ratedKw": 37.285 }` (409 `name_in_use` if another machine on the gateway has that name) (404 for a machine they cannot see) returns the updated `machine`. The UI shows and
+edits horsepower and converts at 1 HP = 0.7457 kW, so `ratedKw` stays the stored value and
+`loadFactor` is recomputed from it.
+
+`machine`:
+
+```json
+{
+  "id": "sheller-1",
+  "name": "Sheller 1",
+  "plant": "Plant 1",
+  "type": "sheller",
+  "ratedKw": 36,
+  "on": true,
+  "updatedAt": 1762320000000,
+  "kw": 26.1,
+  "pf": 0.93,
+  "kva": 28.1,
+  "kvar": 10.4,
+  "current": 39.1,
+  "loadFactor": 72.5,
+  "totalKwh": 41250.4,
+  "totalKvarh": 24337.7,
+  "totalKvah": 47850.5,
+  "runKwh": 143.0,
+  "runStart": 1762291200000,
+  "lastStop": null,
+  "runSec": 28800,
+  "todaySec": 28800,
+  "totalRuntimeSec": 11232000,
+  "avgPfRun": 0.93,
+  "hourlyKwh": [/* 24 numbers, hour 0..23 IST, energy used in that hour */],
+  "hourOn": [/* 24 values: 1 ran, 0 did not, 2 hour not reached yet */]
+}
+```
+
+- `type` is one of `sheller | whitener | sortex`; it picks the picture. Machines of type `sortex` have no power factor or load factor: the UI hides them and the backend must not raise power factor alerts for them.
+- `serverTime` is the server's clock. The UI compares it with `updatedAt` to decide
+  whether a machine is "unknown" (no data for 2 minutes), so it never relies on the
+  viewer's clock.
+- Send `0` for electrical values and `avgPfRun: null` while a machine is off.
+- `runStart` / `lastStop` are epoch ms or `null`.
+
+`alert`:
+
+```json
+{
+  "key": "t1:whitener-2",
+  "thresholdId": "t1",
+  "machineId": "whitener-2",
+  "machineName": "Whitener 2",
+  "plant": "Plant 1",
+  "param": "powerFactor",
+  "severity": "critical",
+  "status": "active",
+  "reading": 0.79,
+  "limit": 0.8,
+  "since": 1762319000000,
+  "recoveredAt": null
+}
+```
+
+`param`: `powerFactor`.
+`severity`: `critical | warning`. `status`: `active | recovered`.
+`key` must be stable for the same threshold and machine.
+
+Alerts are evaluated **by the backend** (so they fire even when nobody has the page
+open, and so SMS can be sent to the phone numbers below). The rules:
+power factor alerts when **below** its limit and is skipped while a machine is
+off. Critical wins over warning.
+
+## Thresholds and phone numbers
+
+Per owner: each plant owner manages their own thresholds and SMS numbers and sees only theirs.
+
+| Method | Path              | Body                   | Response                 |
+| ------ | ----------------- | ---------------------- | ------------------------ |
+| GET    | `/thresholds`     |                        | `[threshold]` |
+| POST   | `/thresholds`     | threshold without `id` | 201 `threshold` |
+| PUT    | `/thresholds/:id` | threshold              | 200 |
+| DELETE | `/thresholds/:id` |                        | 204 |
+| GET    | `/phones`         |                        | `[phone]` |
+| POST   | `/phones`         | phone without `id`     | 201 `phone` |
+| PUT    | `/phones/:id`     | phone                  | 200 |
+| DELETE | `/phones/:id`     |                        | 204 |
+
+`threshold`: `{ id, param, machineId: "all" | "<machine id>", warning: number | null, critical: number | null }`
+Validate on the server: at least one limit set; for `powerFactor` critical ≤ warning;
+for the others critical ≥ warning.
+
+## Notification settings
+
+| Method | Path                      | Body          | Response                    |
+| ------ | ------------------------- | ------------- | --------------------------- |
+| GET    | `/settings/notifications` |               | `notifications` (own)       |
+| PUT    | `/settings/notifications` | notifications | 200 `notifications`         |
+
+`notifications`: `{ alertsEnabled: boolean, autoReports: boolean, reportFrequency: "day" | "week" | "month" }`. When
+`alertsEnabled` is false the backend must not send alert messages; when
+`autoReports` is true it sends the report automatically every `reportFrequency`.
+
+`phone`: `{ id, digits: "9000000001", label }`. `digits` is exactly 10 digits
+(Indian mobile, no country code). Reject duplicates with 409.
+
+## Backend additions (Django, `backend/`)
+
+Everything above is implemented as written. The backend adds the pieces below; see
+`backend/README.md` for setup and deployment.
+
+**Gateway ingest.** `POST /api/ingest` with header `X-Gateway-Key: gw_…`.
+Body `{"readings":[{"meterId":"1","ts":1762400000000,"kw":26.1,"pf":0.93,"kwh":1042.7}]}`
+(a single reading object is also accepted). Only `meterId` and `kw` are required; `ts` may be epoch
+seconds, epoch ms or ISO 8601 (defaults to now). Optional: `kva kvar current voltage frequency
+kwh kvarh kvah on`. Reply `202 {accepted, rejected:[{index,error}], unknownMeters}`; `4xx` means
+fix the data (do not retry), `5xx` / network errors mean retry (duplicates are ignored).
+
+**Gateways and assignment (admin).** Use the Admin Portal endpoints: `GET /admin-portal/gateways?availability=&q=`,
+`GET /admin-portal/gateways/:id/machines` (read-only list of meters, no readings),
+`POST /admin-portal/gateways/:id/rotate-key` (the key is returned once, never again),
+`GET/POST /admin-portal/assignments`, and `POST /admin-portal/assignments/:id/connect|disconnect`.
+A gateway is approved by its first message; there is no verify step. Owners see only the machines,
+plants and alerts of gateways connected to them, and rename a machine with `PUT /machines/:id`.
+
+**Reports.** `GET /reports/daily?plant=&date=YYYY-MM-DD` returns the consolidated per-machine day
+(energy, running energy, runtime, average/max power, average power factor).
+`usage`: `consumedKwh` is all metered energy over the last 7 / 30 IST days (today included);
+`actualKwh` is the part used while the machine was running.
+
+**Realtime.** WebSocket `/api/live/`: send `{"type":"auth","token":"…"}` first, then receive
+`snapshot`, `machines`, `alert` and `alerts` messages (details in
+`backend/apps/telemetry/consumers.py`). The REST endpoints keep working, so polling is a fallback.
+
+**Health.** `GET /api/healthz` (no auth) for load balancer checks.
+
+2 cmp
+
+day
+week
+mont
+
+### Contact form and enquiries
+
+| Method | Path | Notes |
+|---|---|---|
+| POST | `/contact` | Public, no token. Body `{ name, mobile, requirement, website }`. `website` is a hidden spam trap and must be empty. `mobile` is a 10-digit Indian mobile (`+91` or `0` prefix accepted). Returns `201 { ok: true }`; `422` on bad input; `429` after 5 enquiries an hour from one IP. The enquiry is saved first, then `ENQUIRY_NOTIFY_EMAIL` is emailed. |
+| GET | `/admin-portal/enquiries?status=new\|contacted\|closed` | Admin only. Rows `{ id, name, mobile, requirement, status, emailed, createdAt, handledAt, handledBy }`, newest first. |
+| PUT | `/admin-portal/enquiries/:id` | Admin only. Body `{ status }`. |
+
+The admin dashboard also returns `newEnquiries` (count of enquiries still `new`).

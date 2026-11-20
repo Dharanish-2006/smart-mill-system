@@ -1,0 +1,305 @@
+import hmac
+import logging
+from datetime import date as date_cls, timedelta
+from math import ceil
+
+from django.conf import settings
+from django.db import connection
+from django.db.models import Max, Sum
+from django.shortcuts import get_object_or_404
+from django.utils import timezone
+from rest_framework import serializers
+from rest_framework.permissions import AllowAny
+from rest_framework.response import Response
+from rest_framework.throttling import BaseThrottle
+from rest_framework.views import APIView
+
+from apps.accounts.models import hash_secret
+from apps.alerts.models import Alert
+from apps.common.errors import ApiError
+from apps.common.permissions import IsPlantOwner
+from apps.common.timeutil import local_day_start, to_ms
+from apps.plants.access import accessible_machines, window_q
+from apps.plants.models import Gateway, Machine
+from apps.plants.services import ensure_verified
+
+from .consolidate import day_bounds
+from .ingest import ingest
+from .iot import gateway_for_serial
+from .models import HourlyReport, Reading
+from .payloads import build_payloads
+from .reports import owner_report_rows
+from .publish import publish_ingest, publish_machine_change
+
+logger = logging.getLogger(__name__)
+RESERVED_MACHINE_IDS = {"usage"}
+RANGE_DAYS = {"day": 1, "week": 7, "month": 30}
+TREND_MAX_HOURS = 72
+TREND_MAX_POINTS = 360
+
+
+def health(request):
+    from django.http import JsonResponse
+
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT 1")
+    return JsonResponse({"status": "ok"})
+
+
+def _store(gateway, data, request):
+    result = ingest(gateway, data, ip=BaseThrottle().get_ident(request) or None)
+    publish_ingest(gateway, result)
+    body = {"accepted": result.accepted, "rejected": result.rejected, "unknownMeters": result.unknown_meters}
+    if result.accepted == 0 and result.rejected:
+        return Response({"message": "No valid readings in the request.", "code": "validation", **body}, status=422)
+    return Response(body, status=202)
+
+
+class IngestView(APIView):
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        key = request.headers.get("X-Gateway-Key", "").strip()
+        gateway = Gateway.objects.select_related("plant").filter(api_key_hash=hash_secret(key)).first() if key else None
+        if gateway is None:
+            raise ApiError("Invalid gateway key.", 401, "invalid_gateway_key")
+        if not gateway.enabled:
+            raise ApiError("This gateway is disabled.", 403, "gateway_disabled")
+        ensure_verified(gateway)
+
+        return _store(gateway, request.data, request)
+
+
+class IotIngestView(APIView):
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        expected = settings.IOT_RULE_SECRET
+        if not expected:
+            raise ApiError("AWS IoT ingest is turned off.", 404, "not_found")
+        body = request.data if isinstance(request.data, dict) else {}
+
+        # AWS asks the endpoint to confirm itself once, before a rule may use it. That request
+        # carries no secret; log the token so the operator can confirm it with the AWS CLI.
+        token = body.get("confirmationToken")
+        if token and "readings" not in body:
+            logger.warning("AWS IoT destination confirmation token: %s", token)
+            return Response({"status": "confirmation-logged"})
+
+        given = request.headers.get("X-IoT-Secret", "")
+        if not hmac.compare_digest(given.encode(), expected.encode()):
+            raise ApiError("Invalid IoT rule secret.", 401, "invalid_iot_secret")
+
+        gateway = gateway_for_serial(body.get("serial"))
+        return _store(gateway, {"readings": body.get("readings")}, request)
+
+
+class MachineEditSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=100, required=False)
+    type = serializers.ChoiceField(Machine.Type.values, required=False)
+
+    ratedKw = serializers.FloatField(min_value=0, max_value=100000, required=False)
+    onThresholdKw = serializers.FloatField(min_value=0, required=False)
+
+
+class MachineListView(APIView):
+    permission_classes = [IsPlantOwner]
+
+    def get(self, request):
+        machines = accessible_machines(request.user).select_related("state")
+        plant = request.query_params.get("plant")
+        if plant:
+            machines = machines.filter(gateway__plant__name=plant)
+        now = timezone.now()
+        return Response({"serverTime": to_ms(now), "machines": build_payloads(machines, now)})
+
+
+class MachineDetailView(APIView):
+    permission_classes = [IsPlantOwner]
+
+    def put(self, request, pk):
+        machine = get_object_or_404(accessible_machines(request.user), pk=pk)
+        s = MachineEditSerializer(data=request.data, partial=True)
+        s.is_valid(raise_exception=True)
+        d = s.validated_data
+        if "name" in d:
+            name = d["name"].strip()
+            if not name:
+                raise ApiError("Enter a machine name.", 422, "validation")
+            if (
+                Machine.objects.filter(gateway=machine.gateway, name__iexact=name)
+                .exclude(pk=machine.pk)
+                .exists()
+            ):
+                raise ApiError("Another machine on this gateway already has that name.", 409, "name_in_use")
+            machine.name = name
+        if "type" in d:
+            machine.type = d["type"]
+        for src, dst in (("ratedKw", "rated_kw"), ("onThresholdKw", "on_threshold_kw")):
+            if src in d:
+                setattr(machine, dst, d[src])
+        machine.save()
+        machine = Machine.objects.select_related("gateway__plant", "state").get(pk=machine.pk)
+        payload = build_payloads([machine])[0]
+        publish_machine_change(machine)
+        return Response(payload)
+
+    patch = put
+
+
+class UsageView(APIView):
+    permission_classes = [IsPlantOwner]
+
+    """Plant totals over the last 7 / 30 IST days (today included).
+
+    consumedKwh = all energy metered; actualKwh = the part used while machines were running.
+    """
+
+    def get(self, request):
+        days = RANGE_DAYS.get(request.query_params.get("range"))
+        if not days:
+            raise ApiError("Unknown range.", 422, "validation")
+        machines = accessible_machines(request.user)
+        plant = request.query_params.get("plant")
+        if plant:
+            machines = machines.filter(gateway__plant__name=plant)
+        start = local_day_start(timezone.now(), days - 1)
+        totals = HourlyReport.objects.filter(
+            window_q(request.user), machine__in=machines.values("pk"), hour__gte=start
+        ).aggregate(
+            consumed=Sum("kwh"), actual=Sum("run_kwh")
+        )
+        return Response(
+            {"consumedKwh": round(totals["consumed"] or 0, 1), "actualKwh": round(totals["actual"] or 0, 1)}
+        )
+
+
+class MachineSummaryView(APIView):
+    permission_classes = [IsPlantOwner]
+
+    """GET /api/machines/<id>/summary?hours=12|24|168|720 : one machine over the last N hours.
+
+    Built from the hourly reports inside the owner's connection periods, so it matches the
+    reports page. avgLoadFactor is the average power while running over the rated power."""
+
+    HOURS = (12, 24, 168, 720)
+
+    def get(self, request, pk):
+        machine = get_object_or_404(accessible_machines(request.user), pk=pk)
+        try:
+            hours = int(request.query_params.get("hours", 24))
+        except ValueError:
+            hours = 0
+        if hours not in self.HOURS:
+            raise ApiError("hours must be one of 12, 24, 168, 720.", 422, "validation")
+        since = timezone.now() - timedelta(hours=hours)
+        t = HourlyReport.objects.filter(
+            window_q(request.user), machine=machine, hour__gte=since - timedelta(hours=1)
+        ).aggregate(
+            kwh=Sum("kwh"), run_kwh=Sum("run_kwh"), run_seconds=Sum("run_seconds"),
+            sum_pf=Sum("sum_pf"), pf_samples=Sum("pf_samples"),
+        )  # fmt: skip
+        run_seconds = t["run_seconds"] or 0
+        run_kwh = t["run_kwh"] or 0
+        avg_kw = run_kwh / (run_seconds / 3600) if run_seconds else 0
+        return Response(
+            {
+                "hours": hours,
+                "kwh": round(t["kwh"] or 0, 2),
+                "runKwh": round(run_kwh, 2),
+                "runSeconds": int(run_seconds),
+                "avgLoadFactor": round(avg_kw / machine.rated_kw * 100, 1) if machine.rated_kw and avg_kw else 0,
+                "avgPf": round(t["sum_pf"] / t["pf_samples"], 3) if t["pf_samples"] else None,
+            }
+        )
+
+
+class TrendView(APIView):
+    permission_classes = [IsPlantOwner]
+
+    """[{t, pf, current, kw}] oldest first, averaged into at most ~360 buckets."""
+
+    def get(self, request, pk):
+        machine = get_object_or_404(accessible_machines(request.user), pk=pk)
+        try:
+            hours = int(request.query_params.get("hours", 6))
+        except ValueError:
+            hours = 0
+        if not 1 <= hours <= TREND_MAX_HOURS:
+            raise ApiError(f"hours must be between 1 and {TREND_MAX_HOURS}.", 422, "validation")
+
+        bucket = max(settings.RAW_SAMPLE_INTERVAL_SEC, ceil(hours * 3600 / TREND_MAX_POINTS))
+        since = timezone.now() - timedelta(hours=hours)
+
+        buckets = {}
+        rows = Reading.objects.filter(
+            window_q(request.user, gateway_field="machine__gateway", time_field="ts", pad=timedelta(0)),
+            machine=machine, ts__gte=since,
+        ).order_by("ts").values_list(
+            "ts", "kw", "pf", "current", "on"
+        )
+        for ts, kw, pf, current, on in rows.iterator():
+            b = buckets.setdefault(int(ts.timestamp() // bucket), [0, 0.0, 0.0, 0, 0.0])
+            b[0] += 1
+            b[1] += kw
+            b[2] += current
+            if on and pf:
+                b[3] += 1
+                b[4] += pf
+        return Response(
+            [
+                {
+                    "t": key * bucket * 1000,
+                    "pf": round(pf_sum / pf_n, 3) if pf_n else 0,
+                    "current": round(cur_sum / n, 2),
+                    "kw": round(kw_sum / n, 2),
+                }
+                for key, (n, kw_sum, cur_sum, pf_n, pf_sum) in sorted(buckets.items())
+            ]
+        )
+
+
+class DailyReportView(APIView):
+    permission_classes = [IsPlantOwner]
+
+    """GET /api/reports/daily?plant=&date=YYYY-MM-DD : the consolidated report (default: today, IST)."""
+
+    def get(self, request):
+        today = timezone.localdate()
+        raw = request.query_params.get("date")
+        try:
+            day = date_cls.fromisoformat(raw) if raw else today
+        except ValueError:
+            raise ApiError("date must look like 2026-11-06.", 422, "validation") from None
+        if day > today:
+            raise ApiError("That date is in the future.", 422, "validation")
+
+        machines = accessible_machines(request.user)
+        plant = request.query_params.get("plant")
+        if plant:
+            machines = machines.filter(gateway__plant__name=plant)
+        machines = list(machines)
+        ids = [m.pk for m in machines]
+
+        start, end = day_bounds(day)
+        report_rows = {r["machineId"]: r for r in owner_report_rows(request.user, start, end, machines)}
+        active = {}
+        for machine_id in Alert.objects.filter(machine_id__in=ids, status=Alert.Status.ACTIVE).values_list("machine_id", flat=True):
+            active[machine_id] = active.get(machine_id, 0) + 1
+
+        rows = []
+        for m in machines:
+            row = dict(report_rows[m.pk])
+            row.pop("motorHp")
+            row["activeAlerts"] = active.get(m.pk, 0)
+            rows.append(row)
+        return Response(
+            {
+                "date": day.isoformat(),
+                "plant": plant or None,
+                "totalKwh": round(sum(r["kwh"] for r in rows), 2),
+                "machines": rows,
+            }
+        )

@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 360" role="img" aria-label="Machine-wise energy use and power factor">
+  <rect width="520" height="360" rx="22" fill="#e3f0e5"/>
+  <g font-family="Arial,Helvetica,sans-serif">
+    
+    <line x1="40" y1="290" x2="320" y2="290" stroke="#bdb59f" stroke-width="2"/>
+    <g text-anchor="middle" font-size="12" fill="#555">
+      <rect x="56" y="112" width="44" height="178" rx="5" fill="#2f8a4c"/>
+      <rect x="126" y="156" width="44" height="134" rx="5" fill="#2f8a4c"/>
+      <rect x="196" y="196" width="44" height="94" rx="5" fill="#e0a824"/>
+      <rect x="266" y="235" width="44" height="55" rx="5" fill="#7a3b12"/>
+    </g>
+    
+    <!-- gauge -->
+    <g transform="translate(420 190)">
+      <rect x="-86" y="-120" width="172" height="240" rx="16" fill="#fff" stroke="#cfd8d1" stroke-width="2"/>
+      
+      <path d="M-58 20 A58 58 0 0 1 58 20" stroke="#e6ebe7" stroke-width="16" fill="none" stroke-linecap="round"/>
+      <path d="M-58 20 A58 58 0 0 1 -18 -34" stroke="#d64545" stroke-width="16" fill="none" stroke-linecap="round"/>
+      <path d="M-18 -34 A58 58 0 0 1 32 -48" stroke="#e0a824" stroke-width="16" fill="none"/>
+      <path d="M32 -48 A58 58 0 0 1 58 20" stroke="#2f8a4c" stroke-width="16" fill="none" stroke-linecap="round"/>
+      <line x1="0" y1="20" x2="30" y2="-30" stroke="#222" stroke-width="4" stroke-linecap="round"/><circle cx="0" cy="20" r="7" fill="#222"/>
+      
+      
+      
+    </g>
+  </g>
+</svg>
